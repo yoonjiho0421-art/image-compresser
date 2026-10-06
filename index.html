@@ -4,20 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>사진 압축</title>
-
-<!-- PWA -->
-<link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#1a1d1a">
-
-<!-- iOS 홈 화면 추가 지원 -->
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="사진압축">
-<link rel="apple-touch-icon" href="apple-touch-icon.png">
-
-<!-- 아이콘 -->
-<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
-<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
 <style>
   :root {
     --ink: #1a1d1a;
@@ -292,7 +278,7 @@ const qualHint = document.getElementById('qualHint');
 
 let format = 'auto';
 let quality = 80;
-let items = []; // {file, url, resultBlob, resultSize, outName}
+let items = []; // {file, url, resultBlob, resultSize, outName, sourceZip}
 
 qualSlider.addEventListener('input', () => {
   quality = parseInt(qualSlider.value, 10);
@@ -390,7 +376,7 @@ async function extractZip(file) {
     out.push(new File([typedBlob], name, { type }));
   }
 
-  return out;
+  return { files: out, zipName: file.name };
 }
 
 async function handleFiles(fileArr) {
@@ -403,22 +389,25 @@ async function handleFiles(fileArr) {
   const directImages = rawFiles.filter(f => IMAGE_EXT.test(f.name));
   const unsupported = rawFiles.filter(f => !IMAGE_EXT.test(f.name) && !/\.zip$/i.test(f.name) && f.type !== 'application/zip');
 
-  let extracted = [];
+  // {file, sourceZip: null | zipFileName}
+  let extracted = []; // [{file, sourceZip}]
   const zipErrors = [];
   if (zipFiles.length) {
     zipStatus.style.display = 'block';
     zipStatus.textContent = 'ZIP 압축 해제 중...';
     for (const zf of zipFiles) {
       try {
-        const imgs = await extractZip(zf);
-        extracted = extracted.concat(imgs);
+        const { files, zipName } = await extractZip(zf);
+        files.forEach(f => extracted.push({ file: f, sourceZip: zipName }));
       } catch (e) {
         zipErrors.push(`${zf.name}: ${e.message || '압축 해제 실패'}`);
       }
     }
   }
 
-  const allFiles = directImages.concat(extracted);
+  const directEntries = directImages.map(f => ({ file: f, sourceZip: null }));
+  const allEntries = directEntries.concat(extracted);
+  const allFiles = allEntries.map(e => e.file);
   const zipErrorMessage = zipErrors.length
     ? 'ZIP 처리 중 오류 — ' + zipErrors.join(' / ')
     : '';
@@ -459,8 +448,8 @@ async function handleFiles(fileArr) {
     return;
   }
 
-  const oversized = allFiles.filter(f => f.size > MAX_SINGLE_INPUT);
-  const withinLimit = allFiles.filter(f => f.size <= MAX_SINGLE_INPUT);
+  const oversized = allEntries.filter(e => e.file.size > MAX_SINGLE_INPUT);
+  const withinLimit = allEntries.filter(e => e.file.size <= MAX_SINGLE_INPUT);
   if (oversized.length || zipErrorMessage || unsupportedMessage) {
     zipStatus.style.display = 'block';
     zipStatus.textContent = [
@@ -475,8 +464,9 @@ async function handleFiles(fileArr) {
   }
 
   fileInput.value = '';
-  items = withinLimit.map(file => ({
+  items = withinLimit.map(({ file, sourceZip }) => ({
     file,
+    sourceZip,
     url: URL.createObjectURL(file),
     resultBlob: null,
     resultSize: null,
@@ -630,35 +620,59 @@ runBtn.addEventListener('click', async () => {
   fileInput.disabled = false;
   drop.style.pointerEvents = '';
   drop.style.opacity = '';
+  const zipGroupCount = new Set(items.filter(it => it.sourceZip).map(it => it.sourceZip)).size;
+  const totalZipCount = (items.some(it => it.sourceZip === null && it.resultBlob) ? 1 : 0) + zipGroupCount;
   dlBtn.disabled = successCount === 0;
-  dlBtn.textContent = failCount ? `ZIP 저장 (${successCount}개)` : 'ZIP 저장';
+  dlBtn.textContent = totalZipCount > 1
+    ? `ZIP ${totalZipCount}개 저장`
+    : failCount ? `ZIP 저장 (${successCount}개)` : 'ZIP 저장';
 });
+
+async function downloadZip(zipName, zipItems) {
+  const zip = new JSZip();
+  const usedNames = new Set();
+  zipItems.forEach(it => {
+    if (it.resultBlob) zip.file(uniqueZipName(it.outName, usedNames), it.resultBlob);
+  });
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = zipName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 dlBtn.addEventListener('click', async () => {
   dlBtn.disabled = true;
   dlBtn.textContent = 'ZIP 생성 중...';
 
   try {
-    const zip = new JSZip();
-    const usedNames = new Set();
+    const successItems = items.filter(it => it.resultBlob);
 
-    items.forEach(it => {
-      if (it.resultBlob) {
-        zip.file(uniqueZipName(it.outName, usedNames), it.resultBlob);
-      }
+    // 직접 선택한 이미지(sourceZip이 null)는 하나로 묶어 내보냄
+    const directItems = successItems.filter(it => it.sourceZip === null);
+
+    // ZIP에서 온 이미지는 원본 ZIP 이름별로 그룹핑
+    const zipGroups = new Map();
+    successItems.filter(it => it.sourceZip !== null).forEach(it => {
+      if (!zipGroups.has(it.sourceZip)) zipGroups.set(it.sourceZip, []);
+      zipGroups.get(it.sourceZip).push(it);
     });
 
-    const zipBlob = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(zipBlob);
-    const a = document.createElement('a');
+    // 직접 선택 이미지 다운로드
+    if (directItems.length > 0) {
+      await downloadZip('compressed_photos.zip', directItems);
+    }
 
-    a.href = url;
-    a.download = 'compressed_photos.zip';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    // ZIP별로 각각 다운로드 (짧은 간격을 두어 브라우저가 각각 받도록)
+    for (const [zipName, groupItems] of zipGroups) {
+      await new Promise(r => setTimeout(r, 300));
+      const outName = zipName.replace(/\.zip$/i, '') + '_compressed.zip';
+      await downloadZip(outName, groupItems);
+    }
 
     dlBtn.textContent = 'ZIP 저장';
   } catch (e) {
@@ -667,12 +681,6 @@ dlBtn.addEventListener('click', async () => {
     dlBtn.disabled = false;
   }
 });
-
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  });
-}
 </script>
 </body>
 </html>
